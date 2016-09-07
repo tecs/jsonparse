@@ -1,0 +1,227 @@
+#!/bin/bash
+
+INPUT=`cat`
+RETURN=''
+OFFSET=0
+START=-1
+END=-1
+
+error() {
+    echo "$1" >&2
+    exit 1
+}
+
+syntax_error() {
+    error "Syntax error: $1"
+}
+
+parseKey() {
+    echo $1 | sed -r 's/^([a-z][a-z0-9_]*|\[[0-9]+\]).*/\1/i;tx;d;:x'
+}
+
+parseRemainder() {
+    echo $1 | sed -r 's/^([a-z][a-z0-9_]*|\[[0-9]+\])\.?(.*)/\2/i;tx;d;:x'
+}
+
+parseWhitepace() {
+    while true ; do
+        case "${INPUT:$OFFSET:1}" in
+        $'\n'|$'\r'|$'\t'|' ')
+            OFFSET=$(( OFFSET + 1 ))
+        ;;
+        *)
+            break
+        esac
+    done
+}
+
+getValue() {
+    case "${INPUT:$OFFSET:1}" in
+    '"')
+        parseString
+        if [ "$1" != '' ] ; then
+            error "Unexpected offset '$1'"
+        fi
+    ;;
+    [0-9]|-)
+        parseNumber
+        if [ "$1" != '' ] ; then
+            error "Unexpected offset '$1'"
+        fi
+    ;;
+    [a-Z])
+        parseLiteral
+        if [ "$1" != '' ] ; then
+            error "Unexpected offset '$1'"
+        fi
+    ;;
+    '[')
+        getArray $1
+    ;;
+    '{')
+        getObject $1
+    ;;
+    '')
+        syntax_error 'Unexpected end of input'
+    ;;
+    *)
+        syntax_error "Illegal token '${INPUT:$OFFSET:1}'"
+    esac
+}
+
+parseString() {
+    RETURN+='"'
+    local ESCAPE=0
+    while true ; do
+        OFFSET=$(( OFFSET + 1 ))
+        local CHAR=${INPUT:$OFFSET:1}
+        RETURN+="$CHAR"
+        if [ $ESCAPE -eq 1 ] ; then
+            local SEQ=`echo ${INPUT:$OFFSET:5} | sed -r 's/^(["bfnrt/\\]|u[a-fA-F0-9]{4})/\1/;tx;d;:x'`
+            [ "$SEQ" == '' ] && syntax_error "Illegal escape character '\\$CHAR'"
+            ESCAPE=0
+        elif [ "$CHAR" == "\\" ] ; then
+            ESCAPE=1
+        elif [ "$CHAR" == '"' ] ; then
+            OFFSET=$(( OFFSET + 1 ))
+            break
+        elif [ "$CHAR" == '' ] ; then
+            syntax_error "Unexpected end of input"
+        fi
+    done
+}
+
+parseNumber() {
+    local OUT=`echo "${INPUT:$OFFSET}" | sed -r 's/^(-?(0|[1-9][0-9]*)(\.[0-9]+)?(e(-|\+)?[0-9]+)?)(}|,|]|$|\s).*/\1/i;tx;d;:x'`
+    if [ "$OUT" == '' ] ; then
+        syntax_error 'Illegal number'
+    fi
+    OFFSET=$(( OFFSET + ${#OUT} ))
+    RETURN+=$OUT
+}
+
+parseLiteral() {
+    local OUT=`echo "${INPUT:$OFFSET:6}" | sed -r 's/^(true|false|null)(}|,|]|$|\s).*/\1/;tx;d;:x'`
+    if [ "$OUT" == '' ] ; then
+        syntax_error "Unexpected literal '$(echo "${INPUT:$OFFSET}" | sed -r 's/^([^]},]+).*/\1/')'"
+    fi
+    OFFSET=$(( OFFSET + ${#OUT} ))
+    RETURN+=$OUT
+}
+
+getArray() {
+    local KEY=`parseKey "$1"`
+    local REMAINDER=`parseRemainder "$1"`
+    local NEXT="value or end of array"
+    local FOUND=0
+    local i=0
+
+    OFFSET=$(( OFFSET + 1 ))
+    RETURN+='['
+
+    while true ; do
+        parseWhitepace
+
+        SUBVALUE="${INPUT:$OFFSET:1}"
+        if [ "$SUBVALUE" == ',' ] && [ "$NEXT" == "comma or end of array" ] ; then
+            OFFSET=$(( OFFSET + 1 ))
+            RETURN+=','
+            NEXT='value'
+        elif [ "$SUBVALUE" == ']' ] && [ "${NEXT: -12}" == 'end of array' ] ; then
+            break
+        elif [ "$SUBVALUE" == '' ] ; then
+            syntax_error "Unexpected end of input, expected $NEXT"
+        elif [ "${NEXT:0:5}" == 'value' ] ; then
+            if [ "[$i]" == "$KEY" ] ; then
+                FOUND=1
+                if [ "$REMAINDER" == '' ] ; then
+                    START=${#RETURN}
+                fi
+                getValue "$REMAINDER"
+                if [ "$REMAINDER" == '' ] ; then
+                    END=$(( ${#RETURN} - START ))
+                fi
+            else
+                getValue
+            fi
+            i=$(( i + 1 ))
+            NEXT="comma or end of array"
+        else
+            syntax_error "Unexpected token '$SUBVALUE', expected $NEXT"
+        fi
+    done
+    if [ $FOUND -lt 1 ] && [ "$KEY" != '' ] ; then
+        error "Undefined offset '$KEY'"
+    fi
+    OFFSET=$(( OFFSET + 1 ))
+    RETURN+="]"
+}
+
+getObject() {
+    local KEY=`parseKey "$1"`
+    local REMAINDER=`parseRemainder "$1"`
+    local NEXT="key or end of object"
+    local FOUND=0
+    local LASTKEY=0
+
+    OFFSET=$(( OFFSET + 1 ))
+    RETURN+='{'
+
+    while true ; do
+        parseWhitepace
+
+        SUBVALUE="${INPUT:$OFFSET:1}"
+        if [ "$SUBVALUE" == ',' ] && [ "$NEXT" == 'comma or end of object' ] ; then
+            OFFSET=$(( OFFSET + 1 ))
+            RETURN+=','
+            NEXT='key'
+        elif [ "$SUBVALUE" == '"' ] && [ "${NEXT:0:3}" == 'key' ] ; then
+            LASTKEY=${#RETURN}
+            parseString
+            LASTKEY=${RETURN:$(( LASTKEY + 1 )):-1}
+            NEXT='colon'
+        elif [ "$SUBVALUE" == '}' ] && [ "${NEXT: -13}" == 'end of object' ] ; then
+            break
+        elif [ "$SUBVALUE" == ':' ] && [ "$NEXT" == 'colon' ] ; then
+            OFFSET=$(( OFFSET + 1 ))
+            RETURN+=':'
+            NEXT='value'
+        elif [ "$SUBVALUE" == '' ] ; then
+            syntax_error "Unexpected end of input, expected $NEXT"
+        elif [ "$NEXT" == 'value' ] ; then
+            if [ "$LASTKEY" == "$KEY" ] ; then
+                FOUND=1
+                if [ "$REMAINDER" == '' ] ; then
+                    START=${#RETURN}
+                fi
+                getValue "$REMAINDER"
+                if [ "$REMAINDER" == '' ] ; then
+                    END=$(( ${#RETURN} - START ))
+                fi
+            else
+                getValue
+            fi
+            NEXT='comma or end of object'
+        else
+            syntax_error "Unexpected token '$SUBVALUE', expected $NEXT"
+        fi
+    done
+    if [ $FOUND -lt 1 ] && [ "$KEY" != '' ] ; then
+        error "Undefined key '$KEY'"
+    fi
+    OFFSET=$(( OFFSET + 1 ))
+    RETURN+="}"
+}
+
+getValue "$1"
+if [ $START -lt 0 ] ; then
+    START=0
+fi
+if [ $END -lt 0 ] ; then
+    END=${#RETURN}
+fi
+if [ "${RETURN:$START:1}" == '"' ] ; then
+    echo -e ${RETURN:$(( START + 1 )):$(( END - 2 ))}
+else
+    echo ${RETURN:$START:$END}
+fi
